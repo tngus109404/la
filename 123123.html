@@ -127,12 +127,16 @@
   function sleep(ms){ return new Promise(r=>setTimeout(r,ms)) }
 
   function drawFrame(){
-    const v=els.video, c=els.canvas, ctx=c.getContext('2d');
-    if(!v.videoWidth) return null;
-    c.width=v.videoWidth; c.height=v.videoHeight;
-    ctx.drawImage(v,0,0,c.width,c.height);
-    return ctx.getImageData(0,0,c.width,c.height);
-  }
+  const v = els.video;
+  const c = els.canvas, ctx = c.getContext('2d', { willReadFrequently:true });
+  if(!v.videoWidth) return null;
+  const dpr = window.devicePixelRatio || 1;
+  c.width  = Math.floor(v.videoWidth  * dpr);
+  c.height = Math.floor(v.videoHeight * dpr);
+  ctx.imageSmoothingEnabled = false; // 업스케일링 시 블러 방지
+  ctx.drawImage(v, 0, 0, c.width, c.height);
+  return ctx.getImageData(0,0,c.width,c.height);
+}
   function pct2rect(w,h,l,t,r,b){
     const x1=Math.round(w*(l/100)), y1=Math.round(h*(t/100));
     const x2=Math.round(w*(r/100)), y2=Math.round(h*(b/100));
@@ -167,11 +171,12 @@
   async function doOCR(canvas, lang='kor'){
     await ensureOCR(lang);
     await ocrWorker.setParameters({
-      tessedit_pageseg_mode: '7',
-      tessedit_char_whitelist: WL,
-      tessedit_char_blacklist: BL,
-      preserve_interword_spaces: '1'
-    });
+  tessedit_pageseg_mode: '7',
+  tessedit_char_whitelist: WL,
+  tessedit_char_blacklist: BL,
+  preserve_interword_spaces: '1',
+  user_defined_dpi: '300'   // ★ DPI 힌트
+});
     const { data } = await ocrWorker.recognize(canvas);
     return { text:(data.text||'').trim().replace(/\s/g,''), conf:data.confidence||0 };
   }
@@ -224,24 +229,35 @@
 
   // ====== OpenCV 전처리(확대/이진/형태학 + 팽창) ======
   function enhanceForOCR(canvas){
-    const src=cv.imread(canvas);
-    let gray=new cv.Mat();
-    if(src.channels()===4) cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
-    else                   cv.cvtColor(src,gray,cv.COLOR_RGB2GRAY);
-    let up=new cv.Mat();
-    cv.resize(gray,up,new cv.Size(0,0),2,2,cv.INTER_CUBIC);
-    cv.GaussianBlur(up,up,new cv.Size(3,3),0);
-    let bin=new cv.Mat();
-    cv.threshold(up,bin,0,255,cv.THRESH_BINARY|cv.THRESH_OTSU);
-    const k2=cv.getStructuringElement(cv.MORPH_RECT,new cv.Size(2,2));
-    cv.morphologyEx(bin,bin,cv.MORPH_CLOSE,k2,new cv.Point(-1,-1),1);
-    cv.morphologyEx(bin,bin,cv.MORPH_OPEN ,k2,new cv.Point(-1,-1),1);
-    cv.dilate(bin,bin,k2,new cv.Point(-1,-1),1); // 글자 굵게
-    const out=document.createElement('canvas');
-    cv.imshow(out,bin);
-    src.delete(); gray.delete(); up.delete(); bin.delete(); k2.delete();
-    return out;
-  }
+  const UPSCALE = 3; // 2 -> 3배
+  const src = cv.imread(canvas);
+  let gray = new cv.Mat();
+  if (src.channels() === 4) cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  else                      cv.cvtColor(src, gray, cv.COLOR_RGB2GRAY);
+
+  // 업스케일 + 언샵 샤프닝
+  let up = new cv.Mat();
+  cv.resize(gray, up, new cv.Size(0,0), UPSCALE, UPSCALE, cv.INTER_CUBIC);
+  let blur = new cv.Mat();
+  cv.GaussianBlur(up, blur, new cv.Size(0,0), 1.2);
+  cv.addWeighted(up, 1.5, blur, -0.5, 0, up); // 언샵
+  blur.delete();
+
+  // Otsu 이진화
+  let bin = new cv.Mat();
+  cv.threshold(up, bin, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
+
+  // 형태학 보정(닫힘→열림→팽창)
+  const k2 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(2,2));
+  cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, k2, new cv.Point(-1,-1), 1);
+  cv.morphologyEx(bin, bin, cv.MORPH_OPEN , k2, new cv.Point(-1,-1), 1);
+  cv.dilate(bin, bin, k2, new cv.Point(-1,-1), 1);
+
+  const out = document.createElement('canvas');
+  cv.imshow(out, bin);
+  src.delete(); gray.delete(); up.delete(); bin.delete(); k2.delete();
+  return out;
+}
 
   // ====== 보조(반전/그레이/픽셀비율) ======
   function canvasInvert(srcCanvas){
@@ -405,9 +421,22 @@
 
   // ====== 이벤트 ======
   els.btnStart.addEventListener('click', async ()=>{
-    try{ stream=await navigator.mediaDevices.getDisplayMedia({video:{frameRate:{ideal:30,max:60}},audio:false}); els.video.srcObject=stream; setStatus('화면 공유 중'); }
-    catch(e){ console.error(e); setStatus('거부됨'); }
-  });
+  try{
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: {
+        width:  { max: 9999 },   // 가능한 한 크게
+        height: { max: 9999 },
+        frameRate: { ideal: 60, max: 60 },
+        // 힌트: 창만 선택하면 스케일링 덜 탑니다(브라우저가 무시할 수도 있음)
+        displaySurface: "window",
+        logicalSurface: true
+      },
+      audio: false
+    });
+    els.video.srcObject = stream;
+    setStatus('화면 공유 중');
+  }catch(e){ console.error(e); setStatus('거부됨'); }
+});
   els.btnGrab.addEventListener('click', detectOnce);
   els.btnLoop.addEventListener('click', loopDetect);
 

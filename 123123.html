@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>로스트아크 젬 인식 (한글 화이트리스트 OCR + 디버그 썸네일)</title>
+  <title>로스트아크 젬 인식 (화면공유 + ROI 드래그 / 6종 라벨 + 3색 분류)</title>
   <style>
     :root { --bg:#0b1016; --panel:#121a24; --ink:#e9f1ff; --muted:#8ea3b6; --accent:#6aa6ff; }
     html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,Apple SD Gothic Neo,Noto Sans KR,"맑은 고딕",sans-serif}
@@ -26,13 +26,15 @@
     .hr{height:1px;background:rgba(255,255,255,.07);margin:10px -14px}
     .tag{display:inline-block;padding:2px 8px;border-radius:999px;background:#162234;color:#9ec0ff;font-size:12px}
   </style>
+  <!-- OpenCV.js (영상 전처리용) -->
   <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+  <!-- Tesseract.js (브라우저 OCR / 한글 지원) -->
   <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 </head>
 <body>
   <div class="wrap">
-    <h1>아크 그리드 젬 인식 <span class="tag">웹</span></h1>
-    <small>타이틀(예: “질서의 젬 : 안정”) 영역을 드래그로 지정 → 색상 마스킹·전처리 → <b>한글 화이트리스트 OCR</b> → 퍼지 매칭으로 젬 종류 인식, 주색상으로 등급 판정. (HTTPS 또는 http://localhost 필요)</small>
+    <h1>로스트아크 젬 인식 <span class="tag">웹</span></h1>
+    <small>화면공유 허용 → 게임 창 선택 → 우측 캔버스에서 ROI 드래그 → <b>젬 이름 6종</b> + <b>색상 3종</b> 인식. (HTTPS 또는 http://localhost 권장)</small>
 
     <div class="grid" style="margin-top:14px">
       <!-- LEFT -->
@@ -63,7 +65,7 @@
         <div class="hr"></div>
         <div class="row">
           <div>
-            <div class="section-title">ROI · 타이틀 텍스트/색상(%)</div>
+            <div class="section-title">ROI · 타이틀 텍스트(%)</div>
             <div class="row">
               <label>left <input id="gradeL" type="number" value="46" min="0" max="100" style="width:80px">%</label>
               <label>top <input id="gradeT" type="number" value="14" min="0" max="100" style="width:80px">%</label>
@@ -97,8 +99,8 @@
       <div class="card">
         <div class="section-title">결과</div>
         <div class="kv">
-          <b>등급</b><div id="outGrade">-</div>
           <b>젬 종류</b><div id="outGem">-</div>
+          <b>색상</b><div id="outGrade">-</div>
           <b>디버그</b><div id="outDbg" style="white-space:pre-wrap;color:var(--muted)">-</div>
         </div>
 
@@ -122,21 +124,22 @@
     dbgA: $('#dbgA'), dbgB: $('#dbgB'),
   };
 
-  let stream=null, loopOn=false, cvReady=false;
+  let stream=null, loopOn=false;
   function setStatus(s){ els.status.textContent=s }
   function sleep(ms){ return new Promise(r=>setTimeout(r,ms)) }
 
+  // ====== 그리기/ROI ====
   function drawFrame(){
-  const v = els.video;
-  const c = els.canvas, ctx = c.getContext('2d', { willReadFrequently:true });
-  if(!v.videoWidth) return null;
-  const dpr = window.devicePixelRatio || 1;
-  c.width  = Math.floor(v.videoWidth  * dpr);
-  c.height = Math.floor(v.videoHeight * dpr);
-  ctx.imageSmoothingEnabled = false; // 업스케일링 시 블러 방지
-  ctx.drawImage(v, 0, 0, c.width, c.height);
-  return ctx.getImageData(0,0,c.width,c.height);
-}
+    const v = els.video;
+    const c = els.canvas, ctx = c.getContext('2d', { willReadFrequently:true });
+    if(!v.videoWidth) return null;
+    const dpr = window.devicePixelRatio || 1;
+    c.width  = Math.floor(v.videoWidth  * dpr);
+    c.height = Math.floor(v.videoHeight * dpr);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(v, 0, 0, c.width, c.height);
+    return ctx.getImageData(0,0,c.width,c.height);
+  }
   function pct2rect(w,h,l,t,r,b){
     const x1=Math.round(w*(l/100)), y1=Math.round(h*(t/100));
     const x2=Math.round(w*(r/100)), y2=Math.round(h*(b/100));
@@ -149,12 +152,10 @@
     return c;
   }
 
-  // ====== OCR (한글 화이트리스트 + 안전한 언어 전환) ======
-  const WL = '질서혼돈의젬안정견고불변침식왜곡붕괴:'; // 허용 문자
-  const BL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'; // 차단 문자
-
-  let ocrWorker=null;
-  let currentLang='';
+  // ====== OCR (한글 화이트리스트) ======
+  const WL = '질서혼돈의젬안정견고불변침식왜곡붕괴:';
+  const BL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let ocrWorker=null, currentLang='';
   async function ensureOCR(lang='kor'){
     if(!ocrWorker){
       els.ocrState.textContent='로딩중';
@@ -171,17 +172,17 @@
   async function doOCR(canvas, lang='kor'){
     await ensureOCR(lang);
     await ocrWorker.setParameters({
-  tessedit_pageseg_mode: '7',
-  tessedit_char_whitelist: WL,
-  tessedit_char_blacklist: BL,
-  preserve_interword_spaces: '1',
-  user_defined_dpi: '300'   // ★ DPI 힌트
-});
+      tessedit_pageseg_mode: '7',
+      tessedit_char_whitelist: WL,
+      tessedit_char_blacklist: BL,
+      preserve_interword_spaces: '1',
+      user_defined_dpi: '300'
+    });
     const { data } = await ocrWorker.recognize(canvas);
     return { text:(data.text||'').trim().replace(/\s/g,''), conf:data.confidence||0 };
   }
 
-  // ====== 색상 마스킹 & 트림 ======
+  // ====== 색상 마스킹/전처리 ======
   function maskTitleColors(canvas){
     const src = canvas.getContext('2d',{willReadFrequently:true}).getImageData(0,0,canvas.width,canvas.height);
     const {data,width:w,height:h}=src;
@@ -196,7 +197,7 @@
         else if(max===g) hdeg=60*((b-r)/(max-min))+120;
         else             hdeg=60*((r-g)/(max-min))+240;
       }
-      // 연두~초록(55~170) / 청록~파랑(170~255) / 보라(255~340)
+      // 초록(55~170), 파랑(170~255), 보라(255~340)만 허용
       const isColor = s>0.32 && v>0.42 && (
         (hdeg>=55 && hdeg<170) || (hdeg>=170 && hdeg<255) || (hdeg>=255 && hdeg<340)
       );
@@ -226,40 +227,28 @@
     out.getContext('2d').drawImage(maskCanvas,0,top,w,bottom-top+1,0,0,w,bottom-top+1);
     return out;
   }
-
-  // ====== OpenCV 전처리(확대/이진/형태학 + 팽창) ======
   function enhanceForOCR(canvas){
-  const UPSCALE = 3; // 2 -> 3배
-  const src = cv.imread(canvas);
-  let gray = new cv.Mat();
-  if (src.channels() === 4) cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-  else                      cv.cvtColor(src, gray, cv.COLOR_RGB2GRAY);
-
-  // 업스케일 + 언샵 샤프닝
-  let up = new cv.Mat();
-  cv.resize(gray, up, new cv.Size(0,0), UPSCALE, UPSCALE, cv.INTER_CUBIC);
-  let blur = new cv.Mat();
-  cv.GaussianBlur(up, blur, new cv.Size(0,0), 1.2);
-  cv.addWeighted(up, 1.5, blur, -0.5, 0, up); // 언샵
-  blur.delete();
-
-  // Otsu 이진화
-  let bin = new cv.Mat();
-  cv.threshold(up, bin, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
-
-  // 형태학 보정(닫힘→열림→팽창)
-  const k2 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(2,2));
-  cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, k2, new cv.Point(-1,-1), 1);
-  cv.morphologyEx(bin, bin, cv.MORPH_OPEN , k2, new cv.Point(-1,-1), 1);
-  cv.dilate(bin, bin, k2, new cv.Point(-1,-1), 1);
-
-  const out = document.createElement('canvas');
-  cv.imshow(out, bin);
-  src.delete(); gray.delete(); up.delete(); bin.delete(); k2.delete();
-  return out;
-}
-
-  // ====== 보조(반전/그레이/픽셀비율) ======
+    const UPSCALE = 3;
+    const src = cv.imread(canvas);
+    let gray = new cv.Mat();
+    if (src.channels() === 4) cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    else                      cv.cvtColor(src, gray, cv.COLOR_RGB2GRAY);
+    let up = new cv.Mat();
+    cv.resize(gray, up, new cv.Size(0,0), UPSCALE, UPSCALE, cv.INTER_CUBIC);
+    let blur = new cv.Mat();
+    cv.GaussianBlur(up, blur, new cv.Size(0,0), 1.2);
+    cv.addWeighted(up, 1.5, blur, -0.5, 0, up); blur.delete();
+    let bin = new cv.Mat();
+    cv.threshold(up, bin, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
+    const k2 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(2,2));
+    cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, k2, new cv.Point(-1,-1), 1);
+    cv.morphologyEx(bin, bin, cv.MORPH_OPEN , k2, new cv.Point(-1,-1), 1);
+    cv.dilate(bin, bin, k2, new cv.Point(-1,-1), 1);
+    const out = document.createElement('canvas');
+    cv.imshow(out, bin);
+    src.delete(); gray.delete(); up.delete(); bin.delete(); k2.delete();
+    return out;
+  }
   function canvasInvert(srcCanvas){
     const c=document.createElement('canvas'); c.width=srcCanvas.width; c.height=srcCanvas.height;
     const ctx=c.getContext('2d'); ctx.drawImage(srcCanvas,0,0);
@@ -284,25 +273,17 @@
     return cnt/(d.length/4);
   }
 
-  // ====== 퍼지/파싱 & 등급 ======
-  function lcsScore(a,b){
-    const dp=Array(a.length+1).fill(0).map(()=>Array(b.length+1).fill(0));
-    for(let i=1;i<=a.length;i++) for(let j=1;j<=b.length;j++)
-      dp[i][j]=a[i-1]===b[j-1]?dp[i-1][j-1]+1:Math.max(dp[i-1][j],dp[i][j-1]);
-    return dp[a.length][b.length]/Math.max(1,b.length);
-  }
-  function fuzzyChoice(text, cand){ let best={label:'',score:0}; for(const c of cand){ const s=lcsScore(text,c); if(s>best.score) best={label:c,score:s}; } return best; }
+  // ====== 젬 6종 강제 분류 ======
+  const FIX = [['질셔','질서'],['혼동','혼돈'],['점','젬'],['안쩡','안정'],['안성','안정'],['걍고','견고'],['불펀','불변'],['침싯','침식'],['왜걱','왜곡'],['붕괘','붕괴']];
   function parseGemLabelKOR(txt){
     if(!txt) return '';
     let s=txt.replace(/\s/g,'').replace(/[｜|∶：]/g,':').replace(/의?젬/g,'').replace(/[^\uAC00-\uD7A3:]/g,'');
-    const fix=[['질셔','질서'],['혼동','혼돈'],['안쩡','안정'],['안성','안정'],['걍고','견고'],['불펀','불변'],['침싯','침식'],['왜걱','왜곡'],['붕괘','붕괴']];
-    for(const [a,b] of fix) s=s.replaceAll(a,b);
-    const kind=fuzzyChoice(s,['질서','혼돈']), name=fuzzyChoice(s,['안정','견고','불변','침식','왜곡','붕괴']);
-    if(kind.score>=0.6 && name.score>=0.55) return `${kind.label}:${name.label}`;
-    const m=/(질서|혼돈)\s*[:：]\s*(안정|견고|불변|침식|왜곡|붕괴)/.exec(s);
-    return m?`${m[1]}:${m[2]}`:'';
+    for(const [a,b] of FIX) s=s.replaceAll(a,b);
+    const m=/(질서|혼돈)\s*[:：]?\s*(안정|견고|불변|침식|왜곡|붕괴)/.exec(s);
+    return m?`${m[1]}의 젬 : ${m[2]}`:'';
   }
-  function hueToGrade(h){ if(h>=55&&h<170) return '고급'; if(h>=170&&h<255) return '희귀'; if(h>=255&&h<340) return '영웅'; return ''; }
+
+  // ====== 색 3종 강제 분류 (green/blue/purple) ======
   function dominantHueFromCanvas(canvas){
     const ctx=canvas.getContext('2d',{willReadFrequently:true});
     const {width:w,height:h}=canvas; const data=ctx.getImageData(0,0,w,h).data;
@@ -312,60 +293,58 @@
       const max=Math.max(r,g,b), min=Math.min(r,g,b);
       const v=max,s=max===0?0:(max-min)/max; if(v<0.42||s<0.32) continue;
       let hh=0;
-      if(max!==min){ if(max===r) hh=(60*((g-b)/(max-min))+360)%360; else if(max===g) hh=60*((b-r)/(max-min))+120; else hh=60*((r-g)/(max-min))+240; }
+      if(max!==min){
+        if(max===r) hh=(60*((g-b)/(max-min))+360)%360;
+        else if(max===g) hh=60*((b-r)/(max-min))+120;
+        else             hh=60*((r-g)/(max-min))+240;
+      }
       hues.push(hh);
     }
-    if(!hues.length) return NaN; hues.sort((a,b)=>a-b); return hues[hues.length>>1];
+    if(!hues.length) return NaN;
+    hues.sort((a,b)=>a-b);
+    return hues[hues.length>>1]; // 중앙값
+  }
+  function hueToClass(h){
+    if(isNaN(h)) return '';
+    if(h>=55 && h<170) return 'green';
+    if(h>=170 && h<255) return 'blue';
+    if(h>=255 && h<340) return 'purple';
+    // 경계값 보정
+    if(h>=45 && h<55) return 'green';
+    if(h>=340 && h<360) return 'purple';
+    return '';
   }
 
+  // ====== OCR 베스트 선택(마스크 실패 시 raw 경로 포함) ======
   function hangulRatio(s){ if(!s) return 0; const m=s.match(/[\uAC00-\uD7A3]/g); return (m?m.length:0)/s.length; }
-
-  // ====== OCR 베스트 선택(마스크 실패 시 raw 경로 포함, 반전/언어 자동) ======
   async function ocrBest(titleCanvas){
-    // 경로 A: 마스크 기반
+    // 마스크 전처리 경로
     const masked  = maskTitleColors(titleCanvas);
     const trimmed = verticalTrim(masked);
     const ench    = enhanceForOCR(trimmed);
-
-    // 디버그 A 표시
+    // 디버그 표시
     (function showA(){
       const ctxA=els.dbgA.getContext('2d'); ctxA.clearRect(0,0,els.dbgA.width,els.dbgA.height);
       const r=Math.min(els.dbgA.width/ench.width, els.dbgA.height/ench.height);
-      const w=Math.floor(ench.width*r), h=Math.floor(ench.height*r);
-      ctxA.drawImage(ench, 0, 0, w, h);
+      ctxA.drawImage(ench, 0, 0, Math.floor(ench.width*r), Math.floor(ench.height*r));
     })();
 
-    let tries = [
-      [ench, 'kor'],
-      [canvasInvert(ench), 'kor'],
-      [ench, 'kor+eng'],
-      [canvasInvert(ench), 'kor+eng']
-    ];
+    let tries = [[ench,'kor'], [canvasInvert(ench),'kor'], [ench,'kor+eng'], [canvasInvert(ench),'kor+eng']];
 
-    // 마스크 결과가 너무 빈약하면 경로 B: raw 그레이 → 전처리
+    // 마스크가 빈약하면 raw 경로 추가
     if (whitePixelRatio(ench) < 0.005) {
       const rawGray = toGrayCanvas(titleCanvas);
       const rawEnh  = enhanceForOCR(rawGray);
-
-      // 디버그 B 표시
       (function showB(){
         const ctxB=els.dbgB.getContext('2d'); ctxB.clearRect(0,0,els.dbgB.width,els.dbgB.height);
         const r=Math.min(els.dbgB.width/rawEnh.width, els.dbgB.height/rawEnh.height);
-        const w=Math.floor(rawEnh.width*r), h=Math.floor(rawEnh.height*r);
-        ctxB.drawImage(rawEnh, 0, 0, w, h);
+        ctxB.drawImage(rawEnh, 0, 0, Math.floor(rawEnh.width*r), Math.floor(rawEnh.height*r));
       })();
-
-      tries = [
-        [rawEnh, 'kor'], [canvasInvert(rawEnh),'kor'],
-        [rawEnh, 'kor+eng'], [canvasInvert(rawEnh),'kor+eng'],
-        ...tries
-      ];
-    } else {
-      // 디버그 B에도 동일 이미지 복사(비어보이지 않게)
+      tries = [[rawEnh,'kor'], [canvasInvert(rawEnh),'kor'], [rawEnh,'kor+eng'], [canvasInvert(rawEnh),'kor+eng'], ...tries];
+    }else{
       const ctxB=els.dbgB.getContext('2d'); ctxB.clearRect(0,0,els.dbgB.width,els.dbgB.height);
       const r=Math.min(els.dbgB.width/ench.width, els.dbgB.height/ench.height);
-      const w=Math.floor(ench.width*r), h=Math.floor(ench.height*r);
-      ctxB.drawImage(ench, 0, 0, w, h);
+      ctxB.drawImage(ench, 0, 0, Math.floor(ench.width*r), Math.floor(ench.height*r));
     }
 
     let best={text:'',score:-1};
@@ -379,34 +358,43 @@
     return best.text;
   }
 
-  // ====== 감지 ======
+  // ====== 메인 감지 ======
+  function roiRectFromInputs(w,h){
+    return pct2rect(w,h,+els.gradeL.value,+els.gradeT.value,+els.gradeR.value,+els.gradeB.value);
+  }
+
   async function detectOnce(){
     const imgData=drawFrame(); if(!imgData){ setStatus('비디오 대기'); return; }
     const w=imgData.width, h=imgData.height;
-    const rectTitle=pct2rect(w,h,+els.gradeL.value,+els.gradeT.value,+els.gradeR.value,+els.gradeB.value);
-    const rectGem  =pct2rect(w,h,+els.gemL.value,  +els.gemT.value,  +els.gemR.value,  +els.gemB.value);
-
+    const rectTitle=roiRectFromInputs(w,h);
     const titleCanvas=cropImageData(imgData,rectTitle);
 
-    let titleText = await ocrBest(titleCanvas);
-    const gemLabel = parseGemLabelKOR(titleText) || '(미확인)';
+    // OCR → 6종 라벨 강제
+    const rawText = await ocrBest(titleCanvas);
+    const gemLabel = parseGemLabelKOR(rawText) || '(미확인)';
 
+    // 색상 → 3종 강제
     const H = dominantHueFromCanvas(titleCanvas);
-    const gradeLabel = Number.isNaN(H) ? '' : hueToGrade(H);
+    const colorClass = hueToClass(H) || '(미확인)';
 
-    els.outGrade.textContent = gradeLabel ? `${gradeLabel}` : '(등급 미확인)';
     els.outGem.textContent   = gemLabel;
-    els.outDbg.textContent   = `OCR:"${titleText}"  H:${Number.isNaN(H)?'NaN':H.toFixed(1)}°`;
+    els.outGrade.textContent = colorClass;
+    els.outDbg.textContent   = `OCR:"${rawText}"  Hue:${Number.isNaN(H)?'NaN':H.toFixed(1)}°`;
 
+    // ROI 가이드 박스
     const ctx=els.canvas.getContext('2d');
     ctx.save();
     ctx.strokeStyle='#6aa6ff'; ctx.lineWidth=2; ctx.strokeRect(rectTitle.x,rectTitle.y,rectTitle.w,rectTitle.h);
-    ctx.strokeStyle='#85d996'; ctx.lineWidth=2; ctx.strokeRect(rectGem.x,rectGem.y,rectGem.w,rectGem.h);
     ctx.restore();
   }
-  async function loopDetect(){ loopOn=!loopOn; els.btnLoop.textContent=loopOn?'연속 감지 중지':'연속 감지 시작'; while(loopOn){ await detectOnce(); await sleep(200); } }
 
-  // ====== 드래그 ROI ======
+  async function loopDetect(){
+    loopOn=!loopOn;
+    els.btnLoop.textContent=loopOn?'연속 감지 중지':'연속 감지 시작';
+    while(loopOn){ await detectOnce(); await sleep(200); }
+  }
+
+  // ====== 드래그로 ROI 설정 ======
   (function enableRoiDrag(){
     const c=els.canvas, ctx=c.getContext('2d',{willReadFrequently:true});
     let dragging=false,start={x:0,y:0},cur={x:0,y:0};
@@ -416,32 +404,26 @@
     function drawPreview(){ const imgData=drawFrame(); if(!imgData) return; const r=getRect(); ctx.save(); ctx.strokeStyle='#ffcc66'; ctx.setLineDash([6,4]); ctx.lineWidth=2; ctx.strokeRect(r.x,r.y,r.w,r.h); ctx.restore(); }
     c.addEventListener('mousedown',e=>{ if(!c.width) return; dragging=true; start=cur=canvasPoint(e); });
     c.addEventListener('mousemove',e=>{ if(!dragging) return; cur=canvasPoint(e); drawPreview(); });
-    window.addEventListener('mouseup',()=>{ if(!dragging) return; dragging=false; const r=getRect(), p=pxToPct(r), tgt=els.roiTarget.value; if(tgt==='grade'){ els.gradeL.value=p.l|0; els.gradeT.value=p.t|0; els.gradeR.value=p.r|0; els.gradeB.value=p.b|0; } else { els.gemL.value=p.l|0; els.gemT.value=p.t|0; els.gemR.value=p.r|0; els.gemB.value=p.b|0; } detectOnce(); });
+    window.addEventListener('mouseup',()=>{ if(!dragging) return; dragging=false; const r=getRect(), p=pxToPct(r); els.gradeL.value=p.l|0; els.gradeT.value=p.t|0; els.gradeR.value=p.r|0; els.gradeB.value=p.b|0; detectOnce(); });
   })();
 
-  // ====== 이벤트 ======
+  // ====== 버튼 이벤트 ======
   els.btnStart.addEventListener('click', async ()=>{
-  try{
-    stream = await navigator.mediaDevices.getDisplayMedia({
-      video: {
-        width:  { max: 9999 },   // 가능한 한 크게
-        height: { max: 9999 },
-        frameRate: { ideal: 60, max: 60 },
-        // 힌트: 창만 선택하면 스케일링 덜 탑니다(브라우저가 무시할 수도 있음)
-        displaySurface: "window",
-        logicalSurface: true
-      },
-      audio: false
-    });
-    els.video.srcObject = stream;
-    setStatus('화면 공유 중');
-  }catch(e){ console.error(e); setStatus('거부됨'); }
-});
+    try{
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { width:{max:9999}, height:{max:9999}, frameRate:{ideal:60,max:60}, displaySurface:"window", logicalSurface:true },
+        audio: false
+      });
+      els.video.srcObject = stream;
+      setStatus('화면 공유 중');
+    }catch(e){ console.error(e); setStatus('거부됨'); }
+  });
   els.btnGrab.addEventListener('click', detectOnce);
   els.btnLoop.addEventListener('click', loopDetect);
 
+  // ====== OpenCV 준비 상태 표시 ======
   (function waitCv(){
-    if(typeof cv!=='undefined' && cv && (cv.Mat||cv.getBuildInformation)){ cv['onRuntimeInitialized']=()=>{ cvReady=true; els.cvState.textContent='준비'; }; if(cv.Mat){ cvReady=true; els.cvState.textContent='준비'; } }
+    if(typeof cv!=='undefined' && cv && (cv.Mat||cv.getBuildInformation)){ cv['onRuntimeInitialized']=()=>{ els.cvState.textContent='준비'; }; if(cv.Mat){ els.cvState.textContent='준비'; } }
     else setTimeout(waitCv,120);
   })();
 </script>

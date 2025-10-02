@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>로스트아크 젬 인식 (한글 화이트리스트 OCR)</title>
+  <title>로스트아크 젬 인식 (한글 화이트리스트 OCR + 디버그 썸네일)</title>
   <style>
     :root { --bg:#0b1016; --panel:#121a24; --ink:#e9f1ff; --muted:#8ea3b6; --accent:#6aa6ff; }
     html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,Apple SD Gothic Neo,Noto Sans KR,"맑은 고딕",sans-serif}
@@ -32,9 +32,10 @@
 <body>
   <div class="wrap">
     <h1>아크 그리드 젬 인식 <span class="tag">웹</span></h1>
-    <small>타이틀(예: “질서의 젬 : 안정”) 영역을 드래그로 지정 → 색상 마스킹·전처리 → **한글 화이트리스트 OCR** → 퍼지 매칭으로 젬 종류 인식, 주색상으로 등급 판정. (HTTPS 또는 http://localhost 필요)</small>
+    <small>타이틀(예: “질서의 젬 : 안정”) 영역을 드래그로 지정 → 색상 마스킹·전처리 → <b>한글 화이트리스트 OCR</b> → 퍼지 매칭으로 젬 종류 인식, 주색상으로 등급 판정. (HTTPS 또는 http://localhost 필요)</small>
 
     <div class="grid" style="margin-top:14px">
+      <!-- LEFT -->
       <div class="card">
         <div class="row">
           <button id="btnStart">화면 캡처 허용</button>
@@ -92,6 +93,7 @@
         </div>
       </div>
 
+      <!-- RIGHT -->
       <div class="card">
         <div class="section-title">결과</div>
         <div class="kv">
@@ -99,6 +101,10 @@
           <b>젬 종류</b><div id="outGem">-</div>
           <b>디버그</b><div id="outDbg" style="white-space:pre-wrap;color:var(--muted)">-</div>
         </div>
+
+        <div class="section-title" style="margin-top:12px">디버그 입력 미리보기</div>
+        <canvas id="dbgA" width="280" height="60" style="background:#0c141d;border:1px dashed rgba(255,255,255,.15);border-radius:8px"></canvas>
+        <canvas id="dbgB" width="280" height="60" style="background:#0c141d;border:1px dashed rgba(255,255,255,.15);border-radius:8px;margin-top:6px"></canvas>
       </div>
     </div>
   </div>
@@ -113,7 +119,9 @@
     outGrade: $('#outGrade'), outGem: $('#outGem'), outDbg: $('#outDbg'),
     cvState: $('#cvState'), ocrState: $('#ocrState'),
     roiTarget: $('#roiTarget'),
+    dbgA: $('#dbgA'), dbgB: $('#dbgB'),
   };
+
   let stream=null, loopOn=false, cvReady=false;
   function setStatus(s){ els.status.textContent=s }
   function sleep(ms){ return new Promise(r=>setTimeout(r,ms)) }
@@ -137,23 +145,27 @@
     return c;
   }
 
-  // ====== OCR (kor 우선, 화이트리스트/블랙리스트) ======
-  const WL = '질서혼돈의젬안정견고불변침식왜곡붕괴:'; // 허용
-  const BL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'; // 차단
+  // ====== OCR (한글 화이트리스트 + 안전한 언어 전환) ======
+  const WL = '질서혼돈의젬안정견고불변침식왜곡붕괴:'; // 허용 문자
+  const BL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'; // 차단 문자
 
   let ocrWorker=null;
+  let currentLang='';
   async function ensureOCR(lang='kor'){
-    if(ocrWorker) return ocrWorker;
-    els.ocrState.textContent='로딩중';
-    ocrWorker=await Tesseract.createWorker();
-    await ocrWorker.loadLanguage(lang);
-    await ocrWorker.initialize(lang);
-    els.ocrState.textContent='준비';
+    if(!ocrWorker){
+      els.ocrState.textContent='로딩중';
+      ocrWorker = await Tesseract.createWorker();
+    }
+    if(currentLang !== lang){
+      await ocrWorker.loadLanguage(lang);
+      await ocrWorker.initialize(lang);
+      currentLang = lang;
+      els.ocrState.textContent='준비';
+    }
     return ocrWorker;
   }
-  async function doOCR(canvas, lang='kor', invert=false){
+  async function doOCR(canvas, lang='kor'){
     await ensureOCR(lang);
-    // 파라미터: 화이트리스트/블랙리스트 + 라인 모드
     await ocrWorker.setParameters({
       tessedit_pageseg_mode: '7',
       tessedit_char_whitelist: WL,
@@ -179,6 +191,7 @@
         else if(max===g) hdeg=60*((b-r)/(max-min))+120;
         else             hdeg=60*((r-g)/(max-min))+240;
       }
+      // 연두~초록(55~170) / 청록~파랑(170~255) / 보라(255~340)
       const isColor = s>0.32 && v>0.42 && (
         (hdeg>=55 && hdeg<170) || (hdeg>=170 && hdeg<255) || (hdeg>=255 && hdeg<340)
       );
@@ -221,14 +234,38 @@
     let bin=new cv.Mat();
     cv.threshold(up,bin,0,255,cv.THRESH_BINARY|cv.THRESH_OTSU);
     const k2=cv.getStructuringElement(cv.MORPH_RECT,new cv.Size(2,2));
-    // 닫힘 → 열림 → **팽창(굵게)**
     cv.morphologyEx(bin,bin,cv.MORPH_CLOSE,k2,new cv.Point(-1,-1),1);
     cv.morphologyEx(bin,bin,cv.MORPH_OPEN ,k2,new cv.Point(-1,-1),1);
-    cv.dilate(bin,bin,k2,new cv.Point(-1,-1),1);
+    cv.dilate(bin,bin,k2,new cv.Point(-1,-1),1); // 글자 굵게
     const out=document.createElement('canvas');
     cv.imshow(out,bin);
     src.delete(); gray.delete(); up.delete(); bin.delete(); k2.delete();
     return out;
+  }
+
+  // ====== 보조(반전/그레이/픽셀비율) ======
+  function canvasInvert(srcCanvas){
+    const c=document.createElement('canvas'); c.width=srcCanvas.width; c.height=srcCanvas.height;
+    const ctx=c.getContext('2d'); ctx.drawImage(srcCanvas,0,0);
+    const id=ctx.getImageData(0,0,c.width,c.height); const d=id.data;
+    for(let i=0;i<d.length;i+=4){ d[i]=255-d[i]; d[i+1]=255-d[i+1]; d[i+2]=255-d[i+2]; }
+    ctx.putImageData(id,0,0); return c;
+  }
+  function toGrayCanvas(src){
+    const c=document.createElement('canvas'); c.width=src.width; c.height=src.height;
+    const ctx=c.getContext('2d'); ctx.drawImage(src,0,0);
+    const id=ctx.getImageData(0,0,c.width,c.height); const d=id.data;
+    for(let i=0;i<d.length;i+=4){
+      const y=0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2];
+      d[i]=d[i+1]=d[i+2]=y;
+    }
+    ctx.putImageData(id,0,0); return c;
+  }
+  function whitePixelRatio(canvas){
+    const ctx=canvas.getContext('2d',{willReadFrequently:true});
+    const {width:w,height:h}=canvas; const d=ctx.getImageData(0,0,w,h).data;
+    let cnt=0; for(let i=0;i<d.length;i+=4) if(d[i]>200) cnt++;
+    return cnt/(d.length/4);
   }
 
   // ====== 퍼지/파싱 & 등급 ======
@@ -264,28 +301,63 @@
     }
     if(!hues.length) return NaN; hues.sort((a,b)=>a-b); return hues[hues.length>>1];
   }
+
   function hangulRatio(s){ if(!s) return 0; const m=s.match(/[\uAC00-\uD7A3]/g); return (m?m.length:0)/s.length; }
 
-  // ====== OCR 베스트 선택(반전/언어 조합) ======
-  async function ocrBest(canvas){
-    const masked = maskTitleColors(canvas);
+  // ====== OCR 베스트 선택(마스크 실패 시 raw 경로 포함, 반전/언어 자동) ======
+  async function ocrBest(titleCanvas){
+    // 경로 A: 마스크 기반
+    const masked  = maskTitleColors(titleCanvas);
     const trimmed = verticalTrim(masked);
-    const enhanced = enhanceForOCR(trimmed);
+    const ench    = enhanceForOCR(trimmed);
 
-    // 반전 이미지
-    const inv=document.createElement('canvas'); inv.width=enhanced.width; inv.height=enhanced.height;
-    const ictx=inv.getContext('2d'); ictx.drawImage(enhanced,0,0);
-    const id=ictx.getImageData(0,0,inv.width,inv.height);
-    for(let i=0;i<id.data.length;i+=4){ id.data[i]=255-id.data[i]; id.data[i+1]=255-id.data[i+1]; id.data[i+2]=255-id.data[i+2]; }
-    ictx.putImageData(id,0,0);
+    // 디버그 A 표시
+    (function showA(){
+      const ctxA=els.dbgA.getContext('2d'); ctxA.clearRect(0,0,els.dbgA.width,els.dbgA.height);
+      const r=Math.min(els.dbgA.width/ench.width, els.dbgA.height/ench.height);
+      const w=Math.floor(ench.width*r), h=Math.floor(ench.height*r);
+      ctxA.drawImage(ench, 0, 0, w, h);
+    })();
 
-    const tries=[[enhanced,'kor'],[inv,'kor'],[enhanced,'kor+eng'],[inv,'kor+eng']];
-    let best={text:'',score:-1,conf:0};
+    let tries = [
+      [ench, 'kor'],
+      [canvasInvert(ench), 'kor'],
+      [ench, 'kor+eng'],
+      [canvasInvert(ench), 'kor+eng']
+    ];
+
+    // 마스크 결과가 너무 빈약하면 경로 B: raw 그레이 → 전처리
+    if (whitePixelRatio(ench) < 0.005) {
+      const rawGray = toGrayCanvas(titleCanvas);
+      const rawEnh  = enhanceForOCR(rawGray);
+
+      // 디버그 B 표시
+      (function showB(){
+        const ctxB=els.dbgB.getContext('2d'); ctxB.clearRect(0,0,els.dbgB.width,els.dbgB.height);
+        const r=Math.min(els.dbgB.width/rawEnh.width, els.dbgB.height/rawEnh.height);
+        const w=Math.floor(rawEnh.width*r), h=Math.floor(rawEnh.height*r);
+        ctxB.drawImage(rawEnh, 0, 0, w, h);
+      })();
+
+      tries = [
+        [rawEnh, 'kor'], [canvasInvert(rawEnh),'kor'],
+        [rawEnh, 'kor+eng'], [canvasInvert(rawEnh),'kor+eng'],
+        ...tries
+      ];
+    } else {
+      // 디버그 B에도 동일 이미지 복사(비어보이지 않게)
+      const ctxB=els.dbgB.getContext('2d'); ctxB.clearRect(0,0,els.dbgB.width,els.dbgB.height);
+      const r=Math.min(els.dbgB.width/ench.width, els.dbgB.height/ench.height);
+      const w=Math.floor(ench.width*r), h=Math.floor(ench.height*r);
+      ctxB.drawImage(ench, 0, 0, w, h);
+    }
+
+    let best={text:'',score:-1};
     for(const [cnv,lang] of tries){
       try{
-        const {text,conf}=await doOCR(cnv,lang);
-        const score=hangulRatio(text)*0.7 + (conf/100)*0.3;
-        if(text && score>best.score) best={text,score,conf};
+        const {text, conf} = await doOCR(cnv, lang);
+        const score = hangulRatio(text)*0.7 + (conf/100)*0.3;
+        if(text && score>best.score) best={text,score};
       }catch(e){ console.error(e); }
     }
     return best.text;

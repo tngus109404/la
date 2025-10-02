@@ -144,20 +144,21 @@
     return c;
   }
 
-  // ---------- OCR ----------
-  let ocrWorker=null;
-  async function ensureOCR(){
-    if(ocrWorker) return ocrWorker;
-    els.ocrState.textContent='로딩중';
+  // ---------- OCR (한글 우선) ----------
+  let ocrWorker = null;
+  async function ensureOCR(lang = 'kor'){
+    if (ocrWorker) return ocrWorker;
+    els.ocrState.textContent = '로딩중';
     ocrWorker = await Tesseract.createWorker();
-    await ocrWorker.loadLanguage('kor+eng');
-    await ocrWorker.initialize('kor+eng');
-    els.ocrState.textContent='준비';
+    await ocrWorker.loadLanguage(lang);
+    await ocrWorker.initialize(lang);
+    els.ocrState.textContent = '준비';
     return ocrWorker;
   }
-  async function ocrCanvas(canvas){
-    await ensureOCR();
-    const { data:{ text } } = await ocrWorker.recognize(canvas, { tessedit_pageseg_mode: 7 });
+  async function ocrCanvas(canvas, lang = 'kor'){
+    await ensureOCR(lang);
+    const opts = { tessedit_pageseg_mode: 7 }; // 단일 라인
+    const { data:{ text } } = await ocrWorker.recognize(canvas, opts);
     return (text||'').trim().replace(/\s/g,'');
   }
 
@@ -192,6 +193,35 @@
     c.width=w; c.height=h;
     c.getContext('2d').putImageData(out,0,0);
     return c;
+  }
+
+  // ---------- OCR 강화 전처리(OpenCV) ----------
+  function enhanceForOCR(canvas){
+    const src = cv.imread(canvas);
+    let gray = new cv.Mat();
+    if (src.channels() === 4) cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    else                      cv.cvtColor(src, gray, cv.COLOR_RGB2GRAY);
+
+    // 1) 2배 확대 + 블러
+    let up = new cv.Mat();
+    cv.resize(gray, up, new cv.Size(0,0), 2, 2, cv.INTER_CUBIC);
+    cv.GaussianBlur(up, up, new cv.Size(3,3), 0);
+
+    // 2) Otsu 이진화
+    let bin = new cv.Mat();
+    cv.threshold(up, bin, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
+    // cv.bitwise_not(bin, bin); // 필요시 반전
+
+    // 3) 형태학적 닫힘→열림
+    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(2,2));
+    cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, kernel, new cv.Point(-1,-1), 1);
+    cv.morphologyEx(bin, bin, cv.MORPH_OPEN,  kernel, new cv.Point(-1,-1), 1);
+
+    const out = document.createElement('canvas');
+    cv.imshow(out, bin);
+
+    src.delete(); gray.delete(); up.delete(); bin.delete(); kernel.delete();
+    return out;
   }
 
   // ---------- 퍼지 매칭 유틸 ----------
@@ -274,19 +304,23 @@
     const rectTitle = pct2rect(w,h, +els.gradeL.value, +els.gradeT.value, +els.gradeR.value, +els.gradeB.value);
     const rectGem   = pct2rect(w,h, +els.gemL.value,   +els.gemT.value,   +els.gemR.value,   +els.gemB.value);
 
-    // 타이틀 캔버스 & 전처리(색상 마스킹)
-    const titleCanvas = cropImageData(imgData, rectTitle);
-    const ocrCanvasInput = maskTitleColors(titleCanvas);
+    // 타이틀 캔버스 & 전처리(색상 마스킹 → OCR 강화)
+    const titleCanvas   = cropImageData(imgData, rectTitle);
+    const masked        = maskTitleColors(titleCanvas);
+    const ocrReady      = enhanceForOCR(masked);
 
-    // OCR → 젬 라벨
-    let titleText=''; try{ titleText = await ocrCanvas(ocrCanvasInput); }catch(e){ console.error(e); }
-    const gemLabel = parseGemLabelKOR(titleText) || '(미확인)';
+    // 1차: 한글 전용 OCR
+    let titleText = '';
+    try { titleText = await ocrCanvas(ocrReady, 'kor'); } catch(e){ console.error(e); }
+    // 2차: 실패 시 kor+eng로 재시도
+    if(!titleText){
+      try { titleText = await ocrCanvas(ocrReady, 'kor+eng'); } catch(e){ console.error(e); }
+    }
 
-    // 색상 → 등급
-    const H = dominantHueFromCanvas(titleCanvas);
+    const gemLabel   = parseGemLabelKOR(titleText) || '(미확인)';
+    const H          = dominantHueFromCanvas(titleCanvas);
     const gradeLabel = Number.isNaN(H) ? '' : hueToGrade(H);
 
-    // 결과
     els.outGrade.textContent = gradeLabel ? `${gradeLabel}` : '(등급 미확인)';
     els.outGem.textContent   = gemLabel;
     els.outDbg.textContent   = `OCR:"${titleText}"  H:${Number.isNaN(H)?'NaN':H.toFixed(1)}°`;

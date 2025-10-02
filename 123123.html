@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>로스트아크 젬 인식 (타이틀 색상+OCR, 드래그 ROI, 전처리 강화)</title>
+  <title>로스트아크 젬 인식 (한글 화이트리스트 OCR)</title>
   <style>
     :root { --bg:#0b1016; --panel:#121a24; --ink:#e9f1ff; --muted:#8ea3b6; --accent:#6aa6ff; }
     html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,Apple SD Gothic Neo,Noto Sans KR,"맑은 고딕",sans-serif}
@@ -32,7 +32,7 @@
 <body>
   <div class="wrap">
     <h1>아크 그리드 젬 인식 <span class="tag">웹</span></h1>
-    <small>타이틀(예: “질서의 젬 : 안정”) 영역을 드래그로 지정 → 색상 마스킹·전처리 후 OCR → 퍼지 매칭으로 젬 종류 인식, 주색상으로 등급(고급/희귀/영웅) 판정. (HTTPS 또는 http://localhost 필요)</small>
+    <small>타이틀(예: “질서의 젬 : 안정”) 영역을 드래그로 지정 → 색상 마스킹·전처리 → **한글 화이트리스트 OCR** → 퍼지 매칭으로 젬 종류 인식, 주색상으로 등급 판정. (HTTPS 또는 http://localhost 필요)</small>
 
     <div class="grid" style="margin-top:14px">
       <div class="card">
@@ -114,7 +114,6 @@
     cvState: $('#cvState'), ocrState: $('#ocrState'),
     roiTarget: $('#roiTarget'),
   };
-
   let stream=null, loopOn=false, cvReady=false;
   function setStatus(s){ els.status.textContent=s }
   function sleep(ms){ return new Promise(r=>setTimeout(r,ms)) }
@@ -138,7 +137,10 @@
     return c;
   }
 
-  // ---------- OCR (kor 우선) ----------
+  // ====== OCR (kor 우선, 화이트리스트/블랙리스트) ======
+  const WL = '질서혼돈의젬안정견고불변침식왜곡붕괴:'; // 허용
+  const BL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'; // 차단
+
   let ocrWorker=null;
   async function ensureOCR(lang='kor'){
     if(ocrWorker) return ocrWorker;
@@ -149,13 +151,20 @@
     els.ocrState.textContent='준비';
     return ocrWorker;
   }
-  async function doOCR(canvas, lang='kor'){
+  async function doOCR(canvas, lang='kor', invert=false){
     await ensureOCR(lang);
-    const { data } = await ocrWorker.recognize(canvas, { tessedit_pageseg_mode:7 });
+    // 파라미터: 화이트리스트/블랙리스트 + 라인 모드
+    await ocrWorker.setParameters({
+      tessedit_pageseg_mode: '7',
+      tessedit_char_whitelist: WL,
+      tessedit_char_blacklist: BL,
+      preserve_interword_spaces: '1'
+    });
+    const { data } = await ocrWorker.recognize(canvas);
     return { text:(data.text||'').trim().replace(/\s/g,''), conf:data.confidence||0 };
   }
 
-  // ---------- 색상 마스킹 ----------
+  // ====== 색상 마스킹 & 트림 ======
   function maskTitleColors(canvas){
     const src = canvas.getContext('2d',{willReadFrequently:true}).getImageData(0,0,canvas.width,canvas.height);
     const {data,width:w,height:h}=src;
@@ -170,7 +179,6 @@
         else if(max===g) hdeg=60*((b-r)/(max-min))+120;
         else             hdeg=60*((r-g)/(max-min))+240;
       }
-      // 범위 확장: 연두~초록(55~170), 청록~파랑(170~255), 보라(255~340)
       const isColor = s>0.32 && v>0.42 && (
         (hdeg>=55 && hdeg<170) || (hdeg>=170 && hdeg<255) || (hdeg>=255 && hdeg<340)
       );
@@ -178,11 +186,8 @@
       dst[i]=dst[i+1]=dst[i+2]=val; dst[i+3]=255;
     }
     const c=document.createElement('canvas'); c.width=w; c.height=h;
-    c.getContext('2d').putImageData(out,0,0);
-    return c;
+    c.getContext('2d').putImageData(out,0,0); return c;
   }
-
-  // ---------- 마스크 세로 트림(상/하 여백 자동 제거) ----------
   function verticalTrim(maskCanvas){
     const ctx=maskCanvas.getContext('2d',{willReadFrequently:true});
     const {width:w,height:h}=maskCanvas;
@@ -190,14 +195,13 @@
     const rowSum=new Array(h).fill(0);
     for(let y=0;y<h;y++){
       let s=0; const off=y*w*4;
-      for(let x=0;x<w;x++) s+=data[off+x*4]; // 255가 전경
+      for(let x=0;x<w;x++) s+=data[off+x*4];
       rowSum[y]=s/(255*w);
     }
-    const thresh=Math.max(2, Math.floor(w*0.02)); // 전경 픽셀 2% 이상
+    const thresh=Math.max(2, Math.floor(w*0.02));
     let top=0,bottom=h-1;
     while(top<h && rowSum[top]<thresh) top++;
     while(bottom>top && rowSum[bottom]<thresh) bottom--;
-    // 패딩
     top=Math.max(0, top-2); bottom=Math.min(h-1, bottom+2);
     const out=document.createElement('canvas');
     out.width=w; out.height=bottom-top+1;
@@ -205,7 +209,7 @@
     return out;
   }
 
-  // ---------- OpenCV 전처리(확대/이진/형태학) ----------
+  // ====== OpenCV 전처리(확대/이진/형태학 + 팽창) ======
   function enhanceForOCR(canvas){
     const src=cv.imread(canvas);
     let gray=new cv.Mat();
@@ -216,27 +220,25 @@
     cv.GaussianBlur(up,up,new cv.Size(3,3),0);
     let bin=new cv.Mat();
     cv.threshold(up,bin,0,255,cv.THRESH_BINARY|cv.THRESH_OTSU);
-    const kernel=cv.getStructuringElement(cv.MORPH_RECT,new cv.Size(2,2));
-    cv.morphologyEx(bin,bin,cv.MORPH_CLOSE,kernel,new cv.Point(-1,-1),1);
-    cv.morphologyEx(bin,bin,cv.MORPH_OPEN ,kernel,new cv.Point(-1,-1),1);
+    const k2=cv.getStructuringElement(cv.MORPH_RECT,new cv.Size(2,2));
+    // 닫힘 → 열림 → **팽창(굵게)**
+    cv.morphologyEx(bin,bin,cv.MORPH_CLOSE,k2,new cv.Point(-1,-1),1);
+    cv.morphologyEx(bin,bin,cv.MORPH_OPEN ,k2,new cv.Point(-1,-1),1);
+    cv.dilate(bin,bin,k2,new cv.Point(-1,-1),1);
     const out=document.createElement('canvas');
     cv.imshow(out,bin);
-    src.delete(); gray.delete(); up.delete(); bin.delete(); kernel.delete();
+    src.delete(); gray.delete(); up.delete(); bin.delete(); k2.delete();
     return out;
   }
 
-  // ---------- 퍼지/파싱 & 등급 ----------
+  // ====== 퍼지/파싱 & 등급 ======
   function lcsScore(a,b){
     const dp=Array(a.length+1).fill(0).map(()=>Array(b.length+1).fill(0));
     for(let i=1;i<=a.length;i++) for(let j=1;j<=b.length;j++)
       dp[i][j]=a[i-1]===b[j-1]?dp[i-1][j-1]+1:Math.max(dp[i-1][j],dp[i][j-1]);
     return dp[a.length][b.length]/Math.max(1,b.length);
   }
-  function fuzzyChoice(text, cand){
-    let best={label:'',score:0};
-    for(const c of cand){ const s=lcsScore(text,c); if(s>best.score) best={label:c,score:s}; }
-    return best;
-  }
+  function fuzzyChoice(text, cand){ let best={label:'',score:0}; for(const c of cand){ const s=lcsScore(text,c); if(s>best.score) best={label:c,score:s}; } return best; }
   function parseGemLabelKOR(txt){
     if(!txt) return '';
     let s=txt.replace(/\s/g,'').replace(/[｜|∶：]/g,':').replace(/의?젬/g,'').replace(/[^\uAC00-\uD7A3:]/g,'');
@@ -256,46 +258,40 @@
       const r=data[i]/255,g=data[i+1]/255,b=data[i+2]/255;
       const max=Math.max(r,g,b), min=Math.min(r,g,b);
       const v=max,s=max===0?0:(max-min)/max; if(v<0.42||s<0.32) continue;
-      let h=0;
-      if(max!==min){ if(max===r) h=(60*((g-b)/(max-min))+360)%360; else if(max===g) h=60*((b-r)/(max-min))+120; else h=60*((r-g)/(max-min))+240; }
-      hues.push(h);
+      let hh=0;
+      if(max!==min){ if(max===r) hh=(60*((g-b)/(max-min))+360)%360; else if(max===g) hh=60*((b-r)/(max-min))+120; else hh=60*((r-g)/(max-min))+240; }
+      hues.push(hh);
     }
     if(!hues.length) return NaN; hues.sort((a,b)=>a-b); return hues[hues.length>>1];
   }
-
-  // ---------- OCR 최적화: 반전/언어 자동선택 ----------
   function hangulRatio(s){ if(!s) return 0; const m=s.match(/[\uAC00-\uD7A3]/g); return (m?m.length:0)/s.length; }
+
+  // ====== OCR 베스트 선택(반전/언어 조합) ======
   async function ocrBest(canvas){
-    // 1) 색 마스크 → 세로 트림 → 전처리
     const masked = maskTitleColors(canvas);
     const trimmed = verticalTrim(masked);
     const enhanced = enhanceForOCR(trimmed);
 
-    // 2) 비반전/반전 두 개 캔버스 준비
-    const inv = document.createElement('canvas');
-    inv.width = enhanced.width; inv.height = enhanced.height;
-    const ictx = inv.getContext('2d'); ictx.drawImage(enhanced,0,0);
-    // 반전
-    const id = ictx.getImageData(0,0,inv.width,inv.height);
+    // 반전 이미지
+    const inv=document.createElement('canvas'); inv.width=enhanced.width; inv.height=enhanced.height;
+    const ictx=inv.getContext('2d'); ictx.drawImage(enhanced,0,0);
+    const id=ictx.getImageData(0,0,inv.width,inv.height);
     for(let i=0;i<id.data.length;i+=4){ id.data[i]=255-id.data[i]; id.data[i+1]=255-id.data[i+1]; id.data[i+2]=255-id.data[i+2]; }
     ictx.putImageData(id,0,0);
 
-    // 3) 시나리오들: [canvas, lang]
-    const tries = [
-      [enhanced,'kor'], [inv,'kor'], [enhanced,'kor+eng'], [inv,'kor+eng']
-    ];
+    const tries=[[enhanced,'kor'],[inv,'kor'],[enhanced,'kor+eng'],[inv,'kor+eng']];
     let best={text:'',score:-1,conf:0};
     for(const [cnv,lang] of tries){
       try{
         const {text,conf}=await doOCR(cnv,lang);
-        const score = hangulRatio(text)*0.7 + (conf/100)*0.3; // 한글비율 가중
+        const score=hangulRatio(text)*0.7 + (conf/100)*0.3;
         if(text && score>best.score) best={text,score,conf};
       }catch(e){ console.error(e); }
     }
     return best.text;
   }
 
-  // ---------- 감지 ----------
+  // ====== 감지 ======
   async function detectOnce(){
     const imgData=drawFrame(); if(!imgData){ setStatus('비디오 대기'); return; }
     const w=imgData.width, h=imgData.height;
@@ -304,11 +300,9 @@
 
     const titleCanvas=cropImageData(imgData,rectTitle);
 
-    // OCR 베스트 시도
     let titleText = await ocrBest(titleCanvas);
     const gemLabel = parseGemLabelKOR(titleText) || '(미확인)';
 
-    // 색상 → 등급 (원본 타이틀 캔버스에서)
     const H = dominantHueFromCanvas(titleCanvas);
     const gradeLabel = Number.isNaN(H) ? '' : hueToGrade(H);
 
@@ -316,7 +310,6 @@
     els.outGem.textContent   = gemLabel;
     els.outDbg.textContent   = `OCR:"${titleText}"  H:${Number.isNaN(H)?'NaN':H.toFixed(1)}°`;
 
-    // 오버레이
     const ctx=els.canvas.getContext('2d');
     ctx.save();
     ctx.strokeStyle='#6aa6ff'; ctx.lineWidth=2; ctx.strokeRect(rectTitle.x,rectTitle.y,rectTitle.w,rectTitle.h);
@@ -325,7 +318,7 @@
   }
   async function loopDetect(){ loopOn=!loopOn; els.btnLoop.textContent=loopOn?'연속 감지 중지':'연속 감지 시작'; while(loopOn){ await detectOnce(); await sleep(200); } }
 
-  // ---------- 드래그 ROI ----------
+  // ====== 드래그 ROI ======
   (function enableRoiDrag(){
     const c=els.canvas, ctx=c.getContext('2d',{willReadFrequently:true});
     let dragging=false,start={x:0,y:0},cur={x:0,y:0};
@@ -338,7 +331,7 @@
     window.addEventListener('mouseup',()=>{ if(!dragging) return; dragging=false; const r=getRect(), p=pxToPct(r), tgt=els.roiTarget.value; if(tgt==='grade'){ els.gradeL.value=p.l|0; els.gradeT.value=p.t|0; els.gradeR.value=p.r|0; els.gradeB.value=p.b|0; } else { els.gemL.value=p.l|0; els.gemT.value=p.t|0; els.gemR.value=p.r|0; els.gemB.value=p.b|0; } detectOnce(); });
   })();
 
-  // ---------- 이벤트 ----------
+  // ====== 이벤트 ======
   els.btnStart.addEventListener('click', async ()=>{
     try{ stream=await navigator.mediaDevices.getDisplayMedia({video:{frameRate:{ideal:30,max:60}},audio:false}); els.video.srcObject=stream; setStatus('화면 공유 중'); }
     catch(e){ console.error(e); setStatus('거부됨'); }
